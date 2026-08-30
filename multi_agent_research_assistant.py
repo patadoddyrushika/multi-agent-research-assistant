@@ -7,11 +7,10 @@ Original file is located at
     https://colab.research.google.com/drive/10ArX03d021bz0LL32Wu-FM0OptjyT6oz
 """
 
-from google.colab import userdata
+import os
 
-GOOGLE_API_KEY = userdata.get("GOOGLE_API_KEY")
-
-print("API key loaded:", GOOGLE_API_KEY is not None)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -581,12 +580,6 @@ result = research_graph.invoke({
 
 print(result["final_report"])
 
-def check_fact_quality(state: ResearchState):
-
-    print("Fact check completed → moving to writer.")
-
-    return "writer"
-
 graph = StateGraph(ResearchState)
 
 graph.add_node("planner", planner_node)
@@ -628,30 +621,3 @@ result = research_graph.invoke({
 print("Research completed!")
 
 print(result["final_report"])
-
-graph = StateGraph(ResearchState)
-
-graph.add_node("planner", planner_node)
-graph.add_node("researcher", researcher_node)
-graph.add_node("analyst", analyst_node)
-graph.add_node("fact_checker", fact_checker_node)
-graph.add_node("writer", writer_node)
-
-graph.add_edge(START, "planner")
-graph.add_edge("planner", "researcher")
-graph.add_edge("researcher", "analyst")
-graph.add_edge("analyst", "fact_checker")
-
-graph.add_conditional_edges(
-    "fact_checker",
-    check_fact_quality,
-    {
-        "writer": "writer"
-    }
-)
-
-graph.add_edge("writer", END)
-
-research_graph = graph.compile()
-
-print("Graph compiled successfully!")
