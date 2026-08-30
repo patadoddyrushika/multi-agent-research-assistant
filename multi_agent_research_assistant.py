@@ -7,8 +7,6 @@ Original file is located at
     https://colab.research.google.com/drive/10ArX03d021bz0LL32Wu-FM0OptjyT6oz
 """
 
-!pip install -q -U langchain langgraph langchain-google-genai
-
 from google.colab import userdata
 
 GOOGLE_API_KEY = userdata.get("GOOGLE_API_KEY")
@@ -118,8 +116,6 @@ result = research_graph.invoke({
 })
 
 print(result["research_plan"])
-
-!pip install -q -U tavily-python langchain-community
 
 from google.colab import userdata
 from tavily import TavilyClient
