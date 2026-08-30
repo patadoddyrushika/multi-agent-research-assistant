@@ -8,7 +8,7 @@ from tavily import TavilyClient
 
 
 # ============================================================
-# 1. API KEYS
+# API KEYS
 # ============================================================
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -22,17 +22,15 @@ if not TAVILY_API_KEY:
 
 
 # ============================================================
-# 2. TWO GROQ MODELS
+# TWO GROQ MODELS
 # ============================================================
 
-# Model 1: faster model for planning and analysis
 planner_llm = ChatGroq(
     model="openai/gpt-oss-20b",
     groq_api_key=GROQ_API_KEY,
     temperature=0.2,
 )
 
-# Model 2: stronger model for research, fact checking and writing
 research_llm = ChatGroq(
     model="openai/gpt-oss-120b",
     groq_api_key=GROQ_API_KEY,
@@ -41,7 +39,7 @@ research_llm = ChatGroq(
 
 
 # ============================================================
-# 3. TAVILY
+# TAVILY
 # ============================================================
 
 tavily_client = TavilyClient(
@@ -50,7 +48,7 @@ tavily_client = TavilyClient(
 
 
 # ============================================================
-# 4. GRAPH STATE
+# STATE
 # ============================================================
 
 class ResearchState(TypedDict, total=False):
@@ -64,20 +62,42 @@ class ResearchState(TypedDict, total=False):
 
 
 # ============================================================
-# 5. PLANNER
+# HELPER
+# ============================================================
+
+def get_text(response):
+    content = response.content
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if text:
+                    parts.append(text)
+
+        return "\n".join(parts)
+
+    return str(content)
+
+
+# ============================================================
+# PLANNER
 # ============================================================
 
 planner_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            """You are the planning agent in a multi-agent research assistant.
+            """You are the planning agent.
 
-Your job is to create a clear research plan for the user's question.
+Create a research plan for the user's question.
 
-Then create exactly 3 useful web-search queries.
-
-Return your answer in this exact format:
+Return exactly:
 
 RESEARCH PLAN:
 - Step 1: ...
@@ -89,8 +109,7 @@ SEARCH QUERIES:
 2. ...
 3. ...
 
-Do not answer the research question yourself.
-Focus on creating good search queries."""
+Do not answer the question."""
         ),
         (
             "human",
@@ -100,68 +119,83 @@ Focus on creating good search queries."""
 )
 
 
-def planner_node(state: ResearchState) -> ResearchState:
+def planner_node(state: ResearchState):
+
     response = planner_llm.invoke(
         planner_prompt.format_messages(
             question=state["question"]
         )
     )
 
-    text = response.content
+    text = get_text(response)
 
     queries = []
 
     for line in text.splitlines():
+
         line = line.strip()
 
         if line.startswith("1."):
             queries.append(line[2:].strip())
+
         elif line.startswith("2."):
             queries.append(line[2:].strip())
+
         elif line.startswith("3."):
             queries.append(line[2:].strip())
 
-    # Safety fallback if the model does not format the queries perfectly
     if len(queries) < 3:
+
         queries = [
             state["question"],
-            f"{state['question']} causes effects evidence",
-            f"{state['question']} statistics studies reports",
+            f"{state['question']} evidence studies",
+            f"{state['question']} benefits risks statistics",
         ]
 
     return {
-        **state,
+        "question": state["question"],
         "research_plan": text,
         "search_queries": queries[:3],
+        "research_results": [],
+        "analysis": "",
+        "fact_check": "",
+        "final_report": "",
     }
 
 
 # ============================================================
-# 6. RESEARCHER
+# RESEARCHER
 # ============================================================
 
-def researcher_node(state: ResearchState) -> ResearchState:
+def researcher_node(state: ResearchState):
+
     all_results = []
 
     for query in state["search_queries"]:
+
         response = tavily_client.search(
             query=query,
             search_depth="basic",
-            max_results=5,
-            include_answer="basic",
-            include_raw_content=False,
+            max_results=2,
         )
 
         for result in response.get("results", []):
+
+            content = result.get("content", "")
+
+            # Keep each source small so Groq does not exceed TPM limits
+            content = content[:1000]
+
             all_results.append(
                 {
-                    "query": query,
                     "title": result.get("title", ""),
                     "url": result.get("url", ""),
-                    "content": result.get("content", ""),
-                    "score": result.get("score", 0),
+                    "content": content,
                 }
             )
+
+    # Keep at most 6 sources
+    all_results = all_results[:6]
 
     return {
         **state,
@@ -170,75 +204,80 @@ def researcher_node(state: ResearchState) -> ResearchState:
 
 
 # ============================================================
-# 7. ANALYST
+# ANALYST
 # ============================================================
 
 analysis_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            """You are the analysis agent in a research system.
+            """You are the research analysis agent.
 
-Analyze the research material provided.
+Analyze the supplied sources.
 
-Your job is to:
-1. Identify the major findings.
-2. Compare information across sources.
-3. Identify important statistics or evidence.
-4. Identify disagreements or limitations.
-5. Avoid inventing information.
+Identify:
+- major findings
+- important evidence
+- benefits
+- risks
+- limitations
+- disagreements between sources
 
-Use only the supplied research material."""
+Do not invent facts.
+Use only the supplied sources."""
         ),
         (
             "human",
-            """Research question:
+            """Question:
 {question}
 
 Research plan:
 {research_plan}
 
-Research material:
+Sources:
 {research_results}"""
         ),
     ]
 )
 
 
-def analyst_node(state: ResearchState) -> ResearchState:
+def analyst_node(state: ResearchState):
+
+    # Keep the input safely below the model's request limit
+    research_text = str(state["research_results"])[:5000]
+
     response = planner_llm.invoke(
         analysis_prompt.format_messages(
             question=state["question"],
-            research_plan=state["research_plan"],
-            research_results=str(state["research_results"]),
+            research_plan=state["research_plan"][:2500],
+            research_results=research_text,
         )
     )
 
     return {
         **state,
-        "analysis": response.content,
+        "analysis": get_text(response),
     }
 
 
 # ============================================================
-# 8. FACT CHECKER
+# FACT CHECKER
 # ============================================================
 
 fact_check_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            """You are the fact-checking agent.
+            """You are a fact-checking agent.
 
-Review the analysis against the research sources.
+Compare the analysis with the supplied sources.
 
-For each major claim:
-- Determine whether the sources support it.
-- Flag claims that are weak or unsupported.
-- Identify conflicting evidence.
-- Do not invent corrections.
+For the important claims:
+- say whether they are Supported, Partially Supported, or Not Supported
+- briefly explain why
+- identify weak evidence
 
-Return a concise fact-checking assessment."""
+Do not invent evidence."""
         ),
         (
             "human",
@@ -255,23 +294,26 @@ Sources:
 )
 
 
-def fact_checker_node(state: ResearchState) -> ResearchState:
+def fact_checker_node(state: ResearchState):
+
+    research_text = str(state["research_results"])[:4500]
+
     response = research_llm.invoke(
         fact_check_prompt.format_messages(
             question=state["question"],
-            analysis=state["analysis"],
-            research_results=str(state["research_results"]),
+            analysis=state["analysis"][:3500],
+            research_results=research_text,
         )
     )
 
     return {
         **state,
-        "fact_check": response.content,
+        "fact_check": get_text(response),
     }
 
 
 # ============================================================
-# 9. FINAL WRITER
+# WRITER
 # ============================================================
 
 writer_prompt = ChatPromptTemplate.from_messages(
@@ -280,9 +322,9 @@ writer_prompt = ChatPromptTemplate.from_messages(
             "system",
             """You are the final research report writer.
 
-Create a clear, professional research report.
+Write a professional research report.
 
-The report must contain:
+Use these sections:
 
 # Research Report
 
@@ -290,33 +332,29 @@ The report must contain:
 
 ## Key Findings
 
-## Analysis
+## Detailed Analysis
 
 ## Fact Check
+
+## Limitations
 
 ## Conclusion
 
 ## Sources
 
-For the Sources section, list the source title and URL supplied in the research material.
-
-Important rules:
+Rules:
+- Use only information supplied in the sources.
+- Do not invent statistics.
 - Do not invent sources.
-- Do not invent URLs.
-- Do not make claims that are contradicted by the fact check.
-- Clearly distinguish evidence from interpretation.
-- Use readable paragraphs and bullet points where appropriate.
-- Answer the user's original question directly."""
+- Include the source URLs provided.
+- Keep the report clear and concise."""
         ),
         (
             "human",
-            """Original question:
+            """Question:
 {question}
 
-Research plan:
-{research_plan}
-
-Research sources:
+Research:
 {research_results}
 
 Analysis:
@@ -329,25 +367,31 @@ Fact check:
 )
 
 
-def writer_node(state: ResearchState) -> ResearchState:
+def writer_node(state: ResearchState):
+
+    # IMPORTANT:
+    # Limit the total input sent to the 120B model.
+    research_text = str(state["research_results"])[:3500]
+    analysis_text = state["analysis"][:2500]
+    fact_check_text = state["fact_check"][:2000]
+
     response = research_llm.invoke(
         writer_prompt.format_messages(
-            question=state["question"],
-            research_plan=state["research_plan"],
-            research_results=str(state["research_results"]),
-            analysis=state["analysis"],
-            fact_check=state["fact_check"],
+            question=state["question"][:1000],
+            research_results=research_text,
+            analysis=analysis_text,
+            fact_check=fact_check_text,
         )
     )
 
     return {
         **state,
-        "final_report": response.content,
+        "final_report": get_text(response),
     }
 
 
 # ============================================================
-# 10. BUILD LANGGRAPH
+# LANGGRAPH
 # ============================================================
 
 workflow = StateGraph(ResearchState)
