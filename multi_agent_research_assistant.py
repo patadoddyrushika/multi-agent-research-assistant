@@ -54,7 +54,7 @@ if not TAVILY_API_KEY:
 
 # MODEL 1 — GROQ
 groq_llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="llama-3.1-8b-instant",
     groq_api_key=GROQ_API_KEY,
 )
 
