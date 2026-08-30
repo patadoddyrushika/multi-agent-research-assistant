@@ -2,6 +2,7 @@ import os
 from typing import TypedDict, List
 
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
 from tavily import TavilyClient
@@ -12,23 +13,66 @@ from tavily import TavilyClient
 # ============================================================
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY is not set.")
+
+# ============================================================
+# 2. LOAD KEYS FROM STREAMLIT SECRETS IF AVAILABLE
+# ============================================================
+
+try:
+    import streamlit as st
+
+    if not GOOGLE_API_KEY:
+        GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
+
+    if not GROQ_API_KEY:
+        GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+
+    if not TAVILY_API_KEY:
+        TAVILY_API_KEY = st.secrets.get("TAVILY_API_KEY")
+
+except Exception:
+    pass
+
+
+# ============================================================
+# 3. CHECK REQUIRED KEYS
+# ============================================================
+
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY is not set.")
 
 if not TAVILY_API_KEY:
     raise ValueError("TAVILY_API_KEY is not set.")
 
 
 # ============================================================
-# 2. AI MODEL + TAVILY
+# 4. AI MODELS
 # ============================================================
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
-    google_api_key=GOOGLE_API_KEY
+# MODEL 1 — GROQ
+groq_llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    groq_api_key=GROQ_API_KEY,
 )
+
+
+# MODEL 2 — GEMINI
+# Gemini is optional because the free Gemini quota may be exhausted.
+gemini_llm = None
+
+if GOOGLE_API_KEY:
+    gemini_llm = ChatGoogleGenerativeAI(
+        model="gemini-3.6-flash",
+        google_api_key=GOOGLE_API_KEY,
+    )
+
+
+# ============================================================
+# 5. TAVILY
+# ============================================================
 
 tavily_client = TavilyClient(
     api_key=TAVILY_API_KEY
@@ -36,10 +80,10 @@ tavily_client = TavilyClient(
 
 
 # ============================================================
-# 3. RESEARCH STATE
+# 6. STATE
 # ============================================================
 
-class ResearchState(TypedDict, total=False):
+class ResearchState(TypedDict):
     question: str
     research_plan: str
     research_results: List[str]
@@ -50,13 +94,15 @@ class ResearchState(TypedDict, total=False):
 
 
 # ============================================================
-# 4. HELPER FUNCTION
+# 7. HELPER FUNCTION
 # ============================================================
 
 def get_text(response) -> str:
-    """Convert an LLM response into plain text."""
+    """
+    Converts LangChain/Gemini responses into normal text.
+    """
 
-    content = response.content
+    content = getattr(response, "content", response)
 
     if isinstance(content, str):
         return content
@@ -66,9 +112,13 @@ def get_text(response) -> str:
 
         for block in content:
             if isinstance(block, dict):
-                text = block.get("text")
+                text = block.get("text", "")
+
                 if text:
                     parts.append(text)
+
+            elif isinstance(block, str):
+                parts.append(block)
 
         return "\n".join(parts)
 
@@ -76,36 +126,76 @@ def get_text(response) -> str:
 
 
 # ============================================================
-# 5. PLANNER AGENT
+# 8. SAFE GEMINI CALL
 # ============================================================
 
-planner_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """You are a research planning agent.
+def call_gemini(prompt: str) -> str:
+    """
+    Try Gemini first.
+    If Gemini is unavailable or quota is exhausted,
+    automatically use Groq instead.
+    """
 
-Your job is to break a user's research question into
-5 specific research tasks.
+    if gemini_llm is not None:
 
-Do NOT answer the question.
+        try:
+            response = gemini_llm.invoke(prompt)
+
+            return get_text(response)
+
+        except Exception as e:
+
+            error_message = str(e)
+
+            print(
+                "Gemini unavailable. "
+                "Using Groq fallback."
+            )
+
+            print(error_message)
+
+    response = groq_llm.invoke(prompt)
+
+    return get_text(response)
+
+
+# ============================================================
+# 9. PLANNER AGENT
+# ============================================================
+
+planner_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """
+You are a research planning agent.
+
+Your job is to break the user's research question
+into exactly 5 specific research tasks.
+
+Do NOT answer the research question.
 
 Only create a clear research plan.
 
-Return exactly 5 numbered research tasks."""
-    ),
-    (
-        "human",
-        "{question}"
-    )
-])
+Return exactly 5 numbered research tasks.
+""",
+        ),
+        (
+            "human",
+            "{question}",
+        ),
+    ]
+)
+
+planner_chain = planner_prompt | groq_llm
 
 
 def planner_node(state: ResearchState):
 
-    response = llm.invoke(
-        planner_prompt.format_messages(
-            question=state["question"]
-        )
+    response = planner_chain.invoke(
+        {
+            "question": state["question"]
+        }
     )
 
     return {
@@ -114,226 +204,165 @@ def planner_node(state: ResearchState):
 
 
 # ============================================================
-# 6. RESEARCHER AGENT
+# 10. RESEARCHER AGENT
 # ============================================================
-
-query_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """You are a web research query generator.
-
-Given a research question and research plan,
-create exactly 3 useful web search queries.
-
-The queries should cover different aspects of the topic.
-
-Return ONLY the 3 queries, one per line.
-
-Do not number them.
-Do not add explanations."""
-    ),
-    (
-        "human",
-        """Research question:
-
-{question}
-
-Research plan:
-
-{research_plan}"""
-    )
-])
-
 
 def researcher_node(state: ResearchState):
 
     question = state["question"]
-    research_plan = state["research_plan"]
 
-    response = llm.invoke(
-        query_prompt.format_messages(
-            question=question,
-            research_plan=research_plan
-        )
-    )
+    plan = state["research_plan"]
 
-    queries_text = get_text(response)
-
-    queries = [
-        line.strip()
-        for line in queries_text.splitlines()
-        if line.strip()
+    # Ask Tavily to find current information.
+    search_queries = [
+        question,
+        f"{question} causes",
+        f"{question} effects",
+        f"{question} statistics",
+        f"{question} solutions",
     ]
 
-    queries = queries[:3]
+    all_results = []
 
-    research_results = []
-
-    for query in queries:
+    for query in search_queries:
 
         try:
-            results = tavily_client.search(
+
+            response = tavily_client.search(
                 query=query,
-                max_results=3
+                search_depth="advanced",
+                max_results=4,
             )
 
-            formatted_results = []
+            results = response.get("results", [])
 
-            for result in results.get("results", []):
+            for result in results:
 
-                formatted_results.append(
-                    f"TITLE: {result.get('title', '')}\n"
-                    f"URL: {result.get('url', '')}\n"
-                    f"CONTENT: {result.get('content', '')}"
-                )
+                title = result.get("title", "")
+                content = result.get("content", "")
+                url = result.get("url", "")
 
-            if formatted_results:
+                if content:
 
-                research_results.append(
-                    f"SEARCH QUERY: {query}\n\n"
-                    + "\n\n---\n\n".join(formatted_results)
-                )
+                    all_results.append(
+                        f"TITLE: {title}\n"
+                        f"SOURCE: {url}\n"
+                        f"CONTENT: {content}"
+                    )
 
         except Exception as e:
 
-            research_results.append(
-                f"SEARCH QUERY: {query}\n"
-                f"SEARCH ERROR: {str(e)}"
+            all_results.append(
+                f"Tavily search error for '{query}': {e}"
             )
 
-    attempts = state.get("research_attempts", 0)
+    # Remove duplicates.
+    unique_results = []
+
+    seen = set()
+
+    for result in all_results:
+
+        key = result[:300]
+
+        if key not in seen:
+
+            seen.add(key)
+            unique_results.append(result)
+
+    # Limit the amount of text sent to the model.
+    unique_results = unique_results[:15]
 
     return {
-        "research_results": research_results,
-        "research_attempts": attempts + 1
+        "research_results": unique_results,
+        "research_attempts": state.get(
+            "research_attempts",
+            0
+        ) + 1,
     }
 
 
 # ============================================================
-# 7. ANALYST AGENT
+# 11. ANALYST AGENT
 # ============================================================
-
-analyst_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """You are an expert research analyst.
-
-You will receive:
-
-1. A research question
-2. A research plan
-3. Raw web research collected by another agent
-
-Analyze the research and identify the most important findings.
-
-For each major finding:
-
-- Explain the finding clearly.
-- Compare information from different sources when possible.
-- Mention important evidence.
-- Identify disagreements or limitations.
-- Do not invent facts.
-
-Do NOT write the final report yet.
-
-Your job is only to analyze the evidence."""
-    ),
-    (
-        "human",
-        """Research Question:
-
-{question}
-
-Research Plan:
-
-{research_plan}
-
-Raw Research:
-
-{research_results}"""
-    )
-])
-
 
 def analyst_node(state: ResearchState):
 
-    combined_research = "\n\n".join(
-        state.get("research_results", [])
+    research_text = "\n\n".join(
+        state["research_results"]
     )
 
-    response = llm.invoke(
-        analyst_prompt.format_messages(
-            question=state["question"],
-            research_plan=state["research_plan"],
-            research_results=combined_research
-        )
-    )
+    prompt = f"""
+You are an expert research analyst.
+
+Research question:
+{state["question"]}
+
+Research plan:
+{state["research_plan"]}
+
+Collected research:
+{research_text}
+
+Analyze the information.
+
+Identify:
+1. Main findings
+2. Important patterns
+3. Benefits or positive effects
+4. Risks or negative effects
+5. Important statistics
+6. Areas where evidence is uncertain
+
+Do not invent facts.
+
+Clearly distinguish evidence from assumptions.
+"""
+
+    analysis = call_gemini(prompt)
 
     return {
-        "analysis": get_text(response)
+        "analysis": analysis
     }
 
 
 # ============================================================
-# 8. FACT CHECKER AGENT
+# 12. FACT-CHECK AGENT
 # ============================================================
 
-fact_checker_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """You are a careful fact-checking research agent.
+def fact_check_node(state: ResearchState):
 
-You will receive:
+    research_text = "\n\n".join(
+        state["research_results"]
+    )
 
-1. The original research question
-2. An analysis produced by another agent
-3. The original web research and sources
+    prompt = f"""
+You are a fact-checking research agent.
 
-Check whether the important claims in the analysis
-are supported by the available evidence.
-
-For each important claim:
-
-- State the claim.
-- Decide whether it is Supported, Partially Supported,
-  or Not Supported.
-- Give a short explanation.
-- Mention the relevant source URL when available.
-- Do not invent evidence.
-- If evidence is insufficient, clearly say so.
-
-Be objective and critical."""
-    ),
-    (
-        "human",
-        """Research Question:
-
-{question}
+Research question:
+{state["question"]}
 
 Analysis:
+{state["analysis"]}
 
-{analysis}
+Source material:
+{research_text}
 
-Original Research:
+Check the analysis for:
 
-{research_results}"""
-    )
-])
+- unsupported claims
+- exaggerated claims
+- contradictions
+- missing context
+- statistics that need caution
+- claims that appear well supported
 
+Do not invent corrections.
 
-def fact_checker_node(state: ResearchState):
+Return a concise fact-check summary.
+"""
 
-    combined_research = "\n\n".join(
-        state.get("research_results", [])
-    )
-
-    response = llm.invoke(
-        fact_checker_prompt.format_messages(
-            question=state["question"],
-            analysis=state["analysis"],
-            research_results=combined_research
-        )
-    )
+    response = groq_llm.invoke(prompt)
 
     return {
         "fact_check": get_text(response)
@@ -341,123 +370,110 @@ def fact_checker_node(state: ResearchState):
 
 
 # ============================================================
-# 9. FACT CHECK DECISION
+# 13. FINAL REPORT AGENT
 # ============================================================
 
-def check_fact_quality(state: ResearchState):
+def final_report_node(state: ResearchState):
 
-    fact_check = state.get("fact_check", "").lower()
-    attempts = state.get("research_attempts", 0)
+    research_text = "\n\n".join(
+        state["research_results"]
+    )
 
-    # Allow at most one additional research pass.
-    if attempts < 2:
-        if (
-            "not supported" in fact_check
-            or "partially supported" in fact_check
-        ):
-            return "researcher"
+    prompt = f"""
+You are the final research report writer.
 
-    return "writer"
+Create a clear, professional research report.
 
+Research question:
+{state["question"]}
 
-# ============================================================
-# 10. WRITER AGENT
-# ============================================================
+Research plan:
+{state["research_plan"]}
 
-writer_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """You are an expert academic research report writer.
-
-Write a clear, well-structured research report using
-only the research evidence, analysis, and fact-checking
-results provided.
-
-The report must contain:
-
-1. Title
-2. Introduction
-3. Key Findings
-4. Detailed Analysis
-5. Ethical and Social Considerations
-6. Limitations
-7. Conclusion
-8. Sources
-
-Important rules:
-
-- Use only information supported by the provided research.
-- Do not invent statistics, studies, or sources.
-- Clearly distinguish evidence from interpretation.
-- Use a professional academic tone.
-- Keep the report readable and well organized.
-- Include source URLs where appropriate.
-- Do not mention that you are an AI agent."""
-    ),
-    (
-        "human",
-        """Research Question:
-
-{question}
-
-Research Plan:
-
-{research_plan}
-
-Research Evidence:
-
-{research_results}
+Research findings:
+{research_text}
 
 Analysis:
+{state["analysis"]}
 
-{analysis}
+Fact check:
+{state["fact_check"]}
 
-Fact Check:
+Write the final report using this structure:
 
-{fact_check}
+# Research Report
 
-Write the final research report."""
-    )
-])
+## Introduction
 
+## Key Findings
 
-def writer_node(state: ResearchState):
+## Positive Effects / Benefits
 
-    combined_research = "\n\n".join(
-        state.get("research_results", [])
-    )
+## Negative Effects / Risks
 
-    response = llm.invoke(
-        writer_prompt.format_messages(
-            question=state["question"],
-            research_plan=state["research_plan"],
-            research_results=combined_research,
-            analysis=state["analysis"],
-            fact_check=state["fact_check"]
-        )
-    )
+## Evidence and Statistics
+
+## Fact-Check / Limitations
+
+## Conclusion
+
+## Sources
+
+Use only information supported by the research.
+
+Do not invent citations.
+
+Keep the writing clear and suitable for a student or general research audience.
+"""
+
+    final_report = call_gemini(prompt)
 
     return {
-        "final_report": get_text(response)
+        "final_report": final_report
     }
 
 
 # ============================================================
-# 11. BUILD LANGGRAPH WORKFLOW
+# 14. LANGGRAPH WORKFLOW
 # ============================================================
 
 graph = StateGraph(ResearchState)
 
-graph.add_node("planner", planner_node)
-graph.add_node("researcher", researcher_node)
-graph.add_node("analyst", analyst_node)
-graph.add_node("fact_checker", fact_checker_node)
-graph.add_node("writer", writer_node)
+
+graph.add_node(
+    "planner",
+    planner_node
+)
+
+graph.add_node(
+    "researcher",
+    researcher_node
+)
+
+graph.add_node(
+    "analyst",
+    analyst_node
+)
+
+graph.add_node(
+    "fact_checker",
+    fact_check_node
+)
+
+graph.add_node(
+    "final_report",
+    final_report_node
+)
 
 
-# Workflow order
+# ============================================================
+# 15. GRAPH CONNECTIONS
+# ============================================================
 
-graph.add_edge(START, "planner")
+graph.add_edge(
+    START,
+    "planner"
+)
 
 graph.add_edge(
     "planner",
@@ -474,53 +490,57 @@ graph.add_edge(
     "fact_checker"
 )
 
-
-# Fact checker decides whether to
-# research again or write the report.
-
-graph.add_conditional_edges(
+graph.add_edge(
     "fact_checker",
-    check_fact_quality,
-    {
-        "researcher": "researcher",
-        "writer": "writer"
-    }
+    "final_report"
 )
 
-
 graph.add_edge(
-    "writer",
+    "final_report",
     END
 )
 
 
-# Compile the graph
+# ============================================================
+# 16. COMPILE GRAPH
+# ============================================================
 
 research_graph = graph.compile()
 
 
 # ============================================================
-# 12. OPTIONAL COMMAND-LINE TEST
+# 17. TEST FUNCTION
+# ============================================================
+
+def run_research(question: str):
+
+    initial_state = {
+        "question": question,
+        "research_plan": "",
+        "research_results": [],
+        "analysis": "",
+        "fact_check": "",
+        "final_report": "",
+        "research_attempts": 0,
+    }
+
+    return research_graph.invoke(
+        initial_state
+    )
+
+
+# ============================================================
+# 18. COMMAND-LINE TEST
 # ============================================================
 
 if __name__ == "__main__":
 
     question = (
-        "What are the effects of artificial intelligence "
-        "on education?"
+        "What are the effects of artificial "
+        "intelligence on education?"
     )
 
-    result = research_graph.invoke(
-        {
-            "question": question,
-            "research_plan": "",
-            "research_results": [],
-            "analysis": "",
-            "fact_check": "",
-            "final_report": "",
-            "research_attempts": 0
-        }
-    )
+    result = run_research(question)
 
     print("\n")
     print("=" * 80)
@@ -528,4 +548,6 @@ if __name__ == "__main__":
     print("=" * 80)
     print("\n")
 
-    print(result["final_report"])
+    print(
+        result["final_report"]
+    )
